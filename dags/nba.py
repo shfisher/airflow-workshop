@@ -131,15 +131,52 @@ def clean_nba_data(**context):
         # Load data into pandas DataFrame
         df = pd.read_csv(io.BytesIO(data))
         
+        # Log the column names to help debug
+        logging.info(f"DataFrame columns: {df.columns.tolist()}")
+        
+        # Check if expected columns exist, if not, try to identify them
+        if 'first_name' not in df.columns or 'last_name' not in df.columns:
+            # Try to find name columns based on common patterns
+            name_cols = [col for col in df.columns if 'name' in col.lower()]
+            logging.info(f"Found potential name columns: {name_cols}")
+            
+            if len(name_cols) >= 2:
+                # Assume first two name-related columns are first and last names
+                df['first_name'] = df[name_cols[0]]
+                df['last_name'] = df[name_cols[1]]
+            else:
+                # If we can't find separate name columns, create placeholders
+                df['first_name'] = 'Player'
+                df['last_name'] = df.iloc[:, 0]  # Use first column as last name
+        
         # 1. Create a full player name column
         df['full_name'] = df['first_name'] + ' ' + df['last_name']
         
+        # Find the height column
+        height_col = None
+        for col in df.columns:
+            if 'height' in col.lower():
+                height_col = col
+                break
+        
+        if not height_col:
+            # If no column has 'height' in its name, try to identify it by looking for numeric columns
+            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+            logging.info(f"Found numeric columns: {numeric_cols}")
+            
+            if numeric_cols:
+                # Use the first numeric column that's not an index as height
+                height_col = numeric_cols[0]
+                logging.info(f"Using {height_col} as height column")
+            else:
+                raise Exception("Could not identify a height column in the data")
+        
         # 2. Convert heights to metric units
         # Height is in inches, convert to meters (1 inch = 0.0254 meters)
-        df['height_meters'] = df['height'].apply(lambda x: round(x * 0.0254, 2))
+        df['height_meters'] = df[height_col].apply(lambda x: round(x * 0.0254, 2))
         
         # Add height in cm
-        df['height_cm'] = df['height'].apply(lambda x: round(x * 2.54, 1))
+        df['height_cm'] = df[height_col].apply(lambda x: round(x * 2.54, 1))
         
         # 3. Categorize players by position based on height
         def categorize_position(height_m):
