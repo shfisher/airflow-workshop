@@ -23,14 +23,14 @@ default_args = {
     'execution_timeout': timedelta(minutes=5),  # Shorter timeout
 }
 
-# Define the download DAG
-download_dag = DAG(
-    'nba_heights_download',
+# Define a single DAG for the entire pipeline
+nba_pipeline_dag = DAG(
+    'nba_heights_pipeline',
     default_args=default_args,
-    description='Download NBA heights data and upload to S3',
+    description='Download, process and upload NBA heights data to S3',
     schedule_interval=timedelta(days=1),
     start_date=days_ago(1),
-    tags=['nba', 'data', 's3', 'download'],
+    tags=['nba', 'data', 's3', 'pipeline'],
     catchup=False,
 )
 
@@ -42,7 +42,7 @@ def download_and_upload_to_s3(**context):
     url = 'https://www.openintro.org/data/csv/nba_heights.csv'
     
     # S3 details
-    bucket_name = 'shemtov-testing-080525'
+    bucket_name = 'shemtov-testing-080525-01'
     s3_key = f'nba_heights/nba_heights_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
     region_name = 'ap-southeast-1'  # Explicitly set the region
     
@@ -81,32 +81,13 @@ def download_and_upload_to_s3(**context):
         s3_path = f's3://{bucket_name}/{s3_key}'
         logging.info(f"Successfully uploaded NBA heights data to S3: {s3_path}")
         
-        # Store the S3 path for potential downstream tasks
-        context['ti'].xcom_push(key='s3_file_path', value=s3_path)
+        # Store the S3 path for the next task
+        context['ti'].xcom_push(key='raw_s3_file_path', value=s3_path)
         return s3_path
         
     except Exception as e:
         logging.error(f"Failed to download and upload NBA heights data: {str(e)}")
         raise  # Re-raise the exception to fail the task
-
-# Define the download task
-download_and_upload_task = PythonOperator(
-    task_id='download_and_upload_to_s3',
-    python_callable=download_and_upload_to_s3,
-    provide_context=True,
-    dag=download_dag,
-)
-
-# Define the data cleaning DAG
-cleaning_dag = DAG(
-    'nba_heights_cleaning',
-    default_args=default_args,
-    description='Clean NBA heights data from S3 and upload processed data',
-    schedule_interval=timedelta(days=1),
-    start_date=days_ago(1),
-    tags=['nba', 'data', 's3', 'cleaning'],
-    catchup=False,
-)
 
 def clean_nba_data(**context):
     """
@@ -119,11 +100,19 @@ def clean_nba_data(**context):
     4. Sort players by height and reset index
     5. Log statistics about tallest and shortest players
     """
-    # S3 details
-    bucket_name = 'shemtov-testing-080525'
-    region_name = 'ap-southeast-1'
+    # Get the S3 path from the previous task
+    raw_s3_path = context['ti'].xcom_pull(task_ids='download_and_upload_to_s3', key='raw_s3_file_path')
     
-    # Get the most recent file from the nba_heights folder
+    if not raw_s3_path:
+        raise Exception("Raw S3 file path not found in XCom")
+    
+    # Parse bucket and key from the S3 path
+    s3_path_parts = raw_s3_path.replace('s3://', '').split('/', 1)
+    bucket_name = s3_path_parts[0]
+    source_key = s3_path_parts[1]
+    region_name = 'us-east-1'
+    
+    # Get S3 client
     s3_hook = S3Hook(aws_conn_id='aws_default')
     s3_client = boto3.client(
         's3',
@@ -133,20 +122,7 @@ def clean_nba_data(**context):
     )
     
     try:
-        # List objects in the nba_heights folder
-        response = s3_client.list_objects_v2(
-            Bucket=bucket_name,
-            Prefix='nba_heights/'
-        )
-        
-        if 'Contents' not in response or not response['Contents']:
-            raise Exception("No NBA heights data found in S3")
-        
-        # Sort by last modified date to get the most recent file
-        latest_file = sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True)[0]
-        source_key = latest_file['Key']
-        
-        logging.info(f"Processing the most recent NBA heights data: s3://{bucket_name}/{source_key}")
+        logging.info(f"Processing NBA heights data from: s3://{bucket_name}/{source_key}")
         
         # Download the file from S3
         obj = s3_client.get_object(Bucket=bucket_name, Key=source_key)
@@ -225,14 +201,20 @@ def clean_nba_data(**context):
         logging.error(f"Failed to process NBA heights data: {str(e)}")
         raise  # Re-raise the exception to fail the task
 
-# Define the cleaning task
-clean_data_task = PythonOperator(
+# Define the tasks in the single DAG
+download_task = PythonOperator(
+    task_id='download_and_upload_to_s3',
+    python_callable=download_and_upload_to_s3,
+    provide_context=True,
+    dag=nba_pipeline_dag,
+)
+
+clean_task = PythonOperator(
     task_id='clean_nba_data',
     python_callable=clean_nba_data,
     provide_context=True,
-    dag=cleaning_dag,
+    dag=nba_pipeline_dag,
 )
 
-# No dependencies needed for a single task in each DAG
-download_and_upload_task
-clean_data_task
+# Set task dependencies within the single DAG
+download_task >> clean_task
