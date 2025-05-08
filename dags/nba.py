@@ -2,8 +2,6 @@ from datetime import datetime, timedelta
 import requests
 import logging
 import os
-import tempfile
-import time
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -33,12 +31,16 @@ dag = DAG(
     catchup=False,
 )
 
-def download_nba_data(**context):
+def download_and_upload_to_s3(**context):
     """
-    Downloads NBA heights data from OpenIntro website and saves to a temporary file.
+    Downloads NBA heights data from OpenIntro website and uploads directly to S3.
     """
     # URL details
     url = 'https://www.openintro.org/data/csv/nba_heights.csv'
+    
+    # S3 details
+    bucket_name = 'shemtov-testing-080525'
+    s3_key = f'nba_heights/nba_heights_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
     
     # Set up headers for the request
     headers = {
@@ -48,86 +50,40 @@ def download_nba_data(**context):
         'Referer': 'https://www.openintro.org/'
     }
     
-    # Create a temporary file to store the downloaded data
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as temp_file:
-        temp_file_path = temp_file.name
-    
     try:
-        # Download the data with minimal retry
+        # Download the data
         logging.info(f"Attempting to download NBA heights data from {url}")
-        response = requests.get(url, headers=headers, timeout=10)  # Shorter timeout
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()  # Raise an exception for HTTP errors
         
-        # Write the data to the temporary file
-        with open(temp_file_path, 'wb') as f:
-            f.write(response.content)
-        
-        logging.info(f"Successfully downloaded NBA heights data to {temp_file_path}")
-        
-        # Pass the file path to the next task
-        context['ti'].xcom_push(key='temp_file_path', value=temp_file_path)
-        return temp_file_path
-        
-    except Exception as e:
-        # Clean up the temporary file if download fails
-        if os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
-        logging.error(f"Failed to download NBA heights data: {str(e)}")
-        raise  # Re-raise the exception to fail the task
-
-def upload_to_s3(**context):
-    """
-    Uploads the downloaded file to S3 bucket.
-    """
-    # Get the temporary file path from the previous task
-    temp_file_path = context['ti'].xcom_pull(task_ids='download_nba_data', key='temp_file_path')
-    
-    if not temp_file_path or not os.path.exists(temp_file_path):
-        raise Exception("Temporary file not found or does not exist")
-    
-    try:
-        # S3 bucket details
-        bucket_name = 'shemtov-testing-080525'
-        s3_key = f'nba_heights/nba_heights_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
-        
+        # Upload directly to S3
         logging.info(f"Uploading data to S3 bucket {bucket_name} with key {s3_key}")
         s3_hook = S3Hook(aws_conn_id='aws_default')
-        s3_hook.load_file(
-            filename=temp_file_path,
+        s3_hook.load_string(
+            string_data=response.text,
             key=s3_key,
             bucket_name=bucket_name,
             replace=True
         )
-        logging.info(f"Successfully uploaded NBA heights data to S3: s3://{bucket_name}/{s3_key}")
         
-        # Add the S3 path to XCom for potential downstream tasks
-        context['ti'].xcom_push(key='s3_file_path', value=f's3://{bucket_name}/{s3_key}')
-        return f's3://{bucket_name}/{s3_key}'
+        s3_path = f's3://{bucket_name}/{s3_key}'
+        logging.info(f"Successfully uploaded NBA heights data to S3: {s3_path}")
+        
+        # Store the S3 path for potential downstream tasks
+        context['ti'].xcom_push(key='s3_file_path', value=s3_path)
+        return s3_path
         
     except Exception as e:
-        logging.error(f"Failed to upload file to S3: {str(e)}")
+        logging.error(f"Failed to download and upload NBA heights data: {str(e)}")
         raise  # Re-raise the exception to fail the task
-    
-    finally:
-        # Clean up the temporary file
-        if os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
-            logging.info(f"Removed temporary file: {temp_file_path}")
 
-# Define the tasks
-download_task = PythonOperator(
-    task_id='download_nba_data',
-    python_callable=download_nba_data,
+# Define the task
+download_and_upload_task = PythonOperator(
+    task_id='download_and_upload_to_s3',
+    python_callable=download_and_upload_to_s3,
     provide_context=True,
     dag=dag,
 )
 
-upload_task = PythonOperator(
-    task_id='upload_to_s3',
-    python_callable=upload_to_s3,
-    provide_context=True,
-    dag=dag,
-)
-
-# Set task dependencies
-download_task >> upload_task
+# No dependencies needed for a single task
+download_and_upload_task
