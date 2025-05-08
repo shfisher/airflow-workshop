@@ -41,6 +41,7 @@ def download_and_upload_to_s3(**context):
     # S3 details
     bucket_name = 'shemtov-testing-080525'
     s3_key = f'nba_heights/nba_heights_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    region_name = 'ap-southeast-1'  # Explicitly set the region
     
     # Set up headers for the request
     headers = {
@@ -57,13 +58,18 @@ def download_and_upload_to_s3(**context):
         response.raise_for_status()  # Raise an exception for HTTP errors
         
         # Upload directly to S3
-        logging.info(f"Uploading data to S3 bucket {bucket_name} with key {s3_key}")
+        logging.info(f"Uploading data to S3 bucket {bucket_name} with key {s3_key} in region {region_name}")
         s3_hook = S3Hook(aws_conn_id='aws_default')
-        s3_hook.load_string(
-            string_data=response.text,
-            key=s3_key,
-            bucket_name=bucket_name,
-            replace=True
+        
+        # Get the S3 client with the correct region
+        s3_client = s3_hook.get_conn(region_name=region_name)
+        
+        # Upload using the client directly
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Body=response.content,
+            ContentType='text/csv'
         )
         
         s3_path = f's3://{bucket_name}/{s3_key}'
